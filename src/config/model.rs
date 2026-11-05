@@ -249,9 +249,19 @@ pub enum ShellModeConfig {
     NonLogin,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TerminalBackendConfig {
+    #[default]
+    Local,
+    HerdrCore,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
+    /// Runtime used for new pane terminals.
+    pub backend: TerminalBackendConfig,
     /// Executable used for new interactive panes. Empty means SHELL, then /bin/sh.
     pub default_shell: String,
     /// Startup mode for new interactive pane shells.
@@ -1389,13 +1399,19 @@ manifest_check = false
         let default_config = Config::default();
         assert!(default_config.terminal.default_shell.is_empty());
         assert_eq!(default_config.terminal.shell_mode, ShellModeConfig::Auto);
+        assert_eq!(
+            default_config.terminal.backend,
+            TerminalBackendConfig::Local
+        );
 
         let toml = r#"
 [terminal]
+backend = "herdr-core"
 default_shell = "nu"
 shell_mode = "non_login"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.terminal.backend, TerminalBackendConfig::HerdrCore);
         assert_eq!(config.terminal.default_shell, "nu");
         assert_eq!(config.terminal.shell_mode, ShellModeConfig::NonLogin);
     }

@@ -21,6 +21,7 @@ mod cli;
 mod client;
 mod config;
 mod copy_mode;
+mod core_backend;
 mod detect;
 mod events;
 use ghostty_vt as ghostty;
@@ -104,6 +105,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # text = "#cdd6f4"
 
 [terminal]
+# Runtime used for new pane terminals: "local" or "herdr-core".
+# backend = "local"
+
 # Executable used for new interactive panes.
 # Empty means $SHELL, then /bin/sh.
 # default_shell = ""
