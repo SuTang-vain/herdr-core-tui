@@ -70,6 +70,7 @@ pub enum NavDirection {
 }
 
 /// A node in the BSP tree. Public for serialization.
+#[derive(Clone)]
 pub enum Node {
     Pane(PaneId),
     Split {
@@ -287,6 +288,38 @@ impl TileLayout {
             return false;
         }
         swap_pane_ids(&mut self.root, first, second);
+        true
+    }
+
+    /// Move an existing pane next to another pane without changing either ID.
+    /// Any failed removal or insertion restores the original tree and focus.
+    pub fn move_pane(
+        &mut self,
+        moved: PaneId,
+        target: PaneId,
+        direction: Direction,
+        ratio: f32,
+        focus: bool,
+    ) -> bool {
+        let ids = self.pane_ids();
+        if moved == target || ids.len() <= 1 || !ids.contains(&moved) || !ids.contains(&target) {
+            return false;
+        }
+        let original_root = self.root.clone();
+        let original_focus = self.focus;
+        let original_prev_focus = self.prev_focus;
+        let old_root = std::mem::replace(&mut self.root, Node::Pane(PaneId::from_raw(0)));
+        let Some(root) = remove_pane(old_root, moved) else {
+            self.root = original_root;
+            return false;
+        };
+        self.root = root;
+        if !self.insert_pane_near(target, moved, direction, ratio, focus) {
+            self.root = original_root;
+            self.focus = original_focus;
+            self.prev_focus = original_prev_focus;
+            return false;
+        }
         true
     }
 
@@ -990,6 +1023,25 @@ mod tests {
         assert_eq!(pane_rects(&layout), before_rects);
         assert_eq!(split_snapshot(&layout), before_splits);
         assert_eq!(layout.focused(), before_focus);
+    }
+
+    #[test]
+    fn move_pane_preserves_ids_and_invalid_moves_roll_back() {
+        let mut layout = sample_layout();
+
+        assert!(layout.move_pane(pane(4), pane(1), Direction::Vertical, 0.4, true));
+        assert_eq!(layout.pane_count(), 4);
+        assert!(layout.pane_ids().contains(&pane(4)));
+        assert_eq!(layout.focused(), pane(4));
+
+        let before_rects = pane_rects(&layout);
+        let before_splits = split_snapshot(&layout);
+        assert!(!layout.move_pane(pane(4), pane(4), Direction::Horizontal, 0.5, true));
+        assert!(!layout.move_pane(pane(4), pane(99), Direction::Horizontal, 0.5, true));
+        assert!(!layout.move_pane(pane(99), pane(1), Direction::Horizontal, 0.5, true));
+        assert_eq!(pane_rects(&layout), before_rects);
+        assert_eq!(split_snapshot(&layout), before_splits);
+        assert_eq!(layout.focused(), pane(4));
     }
 
     #[test]

@@ -12,9 +12,10 @@ mod writer;
 
 pub use self::io::{clear_history, load, load_history};
 pub use self::restore::restore;
-pub(crate) use self::restore::restored_worktree_space_membership;
 #[cfg(unix)]
 pub use self::restore::{handoff_pane_aliases, restore_handoff};
+pub(crate) use self::restore::{restore_node_remapped, restored_worktree_space_membership};
+pub(crate) use self::snapshot::capture_node;
 pub use self::snapshot::{
     capture, capture_history, DirectionSnapshot, LayoutSnapshot, SessionHistorySnapshot,
     SessionSnapshot, TabSnapshot, WorkspaceSnapshot,

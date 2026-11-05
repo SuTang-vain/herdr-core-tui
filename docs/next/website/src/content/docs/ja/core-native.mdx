@@ -1,0 +1,56 @@
+---
+title: Core-native モード
+description: Herdr server を起動せず、Herdr TUI を herdr-core に直接接続します。
+---
+
+Core-native モードでは、`herdr` が既存の herdr-core インスタンスのターミナルクライアントになります。Herdr Core が agent プロセスと実 PTY を所有し、TUI client が表示状態を管理します。
+
+## Core への直接接続
+
+Core backend を有効にします。
+
+```toml
+[terminal]
+backend = "herdr-core"
+```
+
+`herdr` は core terminals を直接検出します。Herdr server の起動、従来の Herdr socket の作成、従来の `session.json` の読み書きは行いません。core が利用できない場合は、Herdr server にフォールバックせず、明示的なエラーで起動を終了します。
+
+`HERDR_CORE_CLI` は `hc` 実行ファイルを指定します。`HERDR_CORE_MODE=native` は native モードを強制し、`HERDR_CORE_MODE=host` は比較や復旧のため旧 host bridge を選択します。
+
+## レイアウトと永続化
+
+Workspace、tab、pane、focus、分割比率、zoom は client が管理します。各 pane は 1 つの core terminal address に対応します。この対応は従来の server 状態とは別に、設定ディレクトリの `core-native-session.json` に保存されます。
+
+TUI を閉じて再度開くと、同じ address で live terminal に reattach し、代替 terminal は作成しません。終了した terminal は位置と address を保持します。消失した terminal は missing と表示され、暗黙に再作成されません。
+
+`ctrl+b q` で UI を終了すると core terminals を保持します。`ctrl+b x` で pane を明示的に閉じると、対応する live core terminal を kill して対応を削除します。最後の pane を閉じると client を終了します。
+
+## Agent 状態と再開
+
+Client は core events を購読し、core が報告する agent、working、完了状態、turn 情報を表示します。ローカルの `hc attach` プロセスから core agent 状態を推測しません。
+
+core terminal の Kimi session 記録には session id と resume argv が含まれます。記録のある終了済み pane で Enter を押すと、同じ cwd で新しい core terminal を作成し、`kimi --session <id>` を実行します。新しい terminal には以前の address を示す `herdr.resumed-from` ラベルが付きます。記録のない終了済み pane では新しい session を開始しません。
+
+## 操作方法
+
+Core-native モードでは familiar な prefix 操作を使用します。
+
+| キー | 操作 |
+| --- | --- |
+| `ctrl+b v` / `ctrl+b -` | 右 / 下に分割 |
+| `ctrl+b` + 矢印 | 隣接 pane に focus |
+| `ctrl+b shift+h/j/k/l` | 指定方向に swap |
+| `ctrl+b m` + 矢印 | 指定方向に move |
+| `ctrl+b z` | Zoom を切り替え |
+| `ctrl+b c` / `ctrl+b shift+n` | 新しい tab / workspace |
+| `ctrl+b n` / `ctrl+b p` | 次 / 前の tab |
+| `ctrl+b ]` / `ctrl+b [` | 次 / 前の workspace |
+| `ctrl+b x` | 現在の core terminal を閉じて kill |
+| `ctrl+b q` | UI を終了し core terminals を保持 |
+| `ctrl+b b` | Core terminal browser を開く |
+| `ctrl+b r` | Core metadata を更新 |
+
+## 対象範囲
+
+Core-native は現在、単一の TUI client を対象とします。複数 client 間の layout 共有、Herdr App への TUI layout 同期、remote core セットアップ、従来の Herdr plugin のエミュレーションは行いません。これらは terminal と agent の永続化とは別の機能です。

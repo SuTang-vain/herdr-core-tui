@@ -2699,6 +2699,7 @@ impl PaneRuntime {
         initial_state: SpawnInitialState<'_>,
         agent_detection: AgentDetection,
     ) -> std::io::Result<Self> {
+        let cmd = crate::core_backend::prepare_pane_command(pane_id, cmd)?;
         crate::logging::pane_spawn_started(pane_id.raw(), rows, cols, scrollback_limit_bytes);
 
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);

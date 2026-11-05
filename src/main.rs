@@ -21,6 +21,8 @@ mod cli;
 mod client;
 mod config;
 mod copy_mode;
+mod core_backend;
+mod core_native;
 mod detect;
 mod events;
 use ghostty_vt as ghostty;
@@ -104,6 +106,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # text = "#cdd6f4"
 
 [terminal]
+# Runtime used for new pane terminals: "local" or "herdr-core".
+# backend = "local"
+
 # Executable used for new interactive panes.
 # Empty means $SHELL, then /bin/sh.
 # default_shell = ""
@@ -796,6 +801,14 @@ fn main() -> io::Result<()> {
 
     let loaded_config = config::Config::load();
     exit_if_nested_disabled(&loaded_config.config);
+
+    if core_native::requested(&loaded_config.config) {
+        if let Err(err) = core_native::run() {
+            eprintln!("herdr: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     let saved_federation =
         client::endpoint::EndpointCatalog::load().is_ok_and(|catalog| catalog.has_enabled_ssh());

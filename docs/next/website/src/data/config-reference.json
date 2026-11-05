@@ -413,6 +413,16 @@
       "title": "Terminal",
       "keys": [
         {
+          "key": "terminal.backend",
+          "type": "enum",
+          "default": "\"local\"",
+          "description": "Runtime used for new pane terminals. The herdr-core backend runs the TUI as a direct core client, keeps layout in the client, and maps each pane to a core terminal without starting a Herdr server. See Core-native mode.",
+          "values": [
+            "local",
+            "herdr-core"
+          ]
+        },
+        {
           "key": "terminal.default_shell",
           "type": "string",
           "default": "\"\"",
