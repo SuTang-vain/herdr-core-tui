@@ -22,7 +22,7 @@ SUBJECT_RE = re.compile(r"^(?P<kind>[a-z]+)(?:\([^)]+\))?!?:\s+\S")
 
 def git_subjects(rev_range: str) -> list[str]:
     output = subprocess.check_output(
-        ["git", "log", "--pretty=format:%s", rev_range], text=True
+        ["git", "log", "--no-merges", "--pretty=format:%s", rev_range], text=True
     ).strip()
     return [line.strip() for line in output.splitlines() if line.strip()]
 
