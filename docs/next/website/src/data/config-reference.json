@@ -413,6 +413,16 @@
       "title": "Terminal",
       "keys": [
         {
+          "key": "terminal.backend",
+          "type": "enum",
+          "default": "\"local\"",
+          "description": "Runtime used for new pane terminals. The experimental herdr-core backend creates a core terminal for each pane and attaches the existing Herdr renderer to it.",
+          "values": [
+            "local",
+            "herdr-core"
+          ]
+        },
+        {
           "key": "terminal.default_shell",
           "type": "string",
           "default": "\"\"",
