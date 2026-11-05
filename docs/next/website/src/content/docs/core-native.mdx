@@ -1,0 +1,56 @@
+---
+title: Core-native mode
+description: Run the Herdr TUI directly on herdr-core without a Herdr server.
+---
+
+Core-native mode makes `herdr` a terminal client for an existing herdr-core instance. Herdr Core owns agent processes and real PTYs; the TUI client owns presentation state.
+
+## Direct core connection
+
+Enable the core backend:
+
+```toml
+[terminal]
+backend = "herdr-core"
+```
+
+Running `herdr` discovers core terminals directly. It does not start a Herdr server, create legacy Herdr sockets, or read or write the legacy `session.json`. If core is unavailable, startup fails with an explicit error instead of falling back to a Herdr server.
+
+`HERDR_CORE_CLI` selects the `hc` executable. `HERDR_CORE_MODE=native` forces native mode; `HERDR_CORE_MODE=host` selects the legacy host bridge for comparison or recovery.
+
+## Layout and persistence
+
+Workspaces, tabs, panes, focus, split ratios, and zoom belong to the client. Each pane maps to one core terminal address. The mapping is stored in `core-native-session.json` beside the Herdr configuration, separately from legacy server state.
+
+Closing and reopening the TUI reattaches live terminals at the same addresses without creating replacements. A finished terminal keeps its place and address. A missing terminal is shown as missing and is not silently recreated.
+
+Quitting the UI with `ctrl+b q` preserves core terminals. Explicitly closing a pane with `ctrl+b x` kills its live core terminal and removes the mapping. Closing the last pane exits the client.
+
+## Agent status and resume
+
+The client subscribes to core events and displays the core-reported agent, working state, completion state, and turn information. It does not infer core agent state from the local `hc attach` process.
+
+Kimi session records reported for a core terminal provide a session id and resume argv. Press Enter on a finished pane with a recorded session to start a new core terminal with `kimi --session <id>` and the same cwd. The new terminal carries a `herdr.resumed-from` label with the previous address. A finished pane without a recorded session does not start a new session.
+
+## Controls
+
+Core-native mode uses the familiar prefix controls:
+
+| Key | Action |
+| --- | --- |
+| `ctrl+b v` / `ctrl+b -` | Split right / down |
+| `ctrl+b` + arrow | Focus a neighboring pane |
+| `ctrl+b shift+h/j/k/l` | Swap in a direction |
+| `ctrl+b m` + arrow | Move in a direction |
+| `ctrl+b z` | Toggle zoom |
+| `ctrl+b c` / `ctrl+b shift+n` | New tab / workspace |
+| `ctrl+b n` / `ctrl+b p` | Next / previous tab |
+| `ctrl+b ]` / `ctrl+b [` | Next / previous workspace |
+| `ctrl+b x` | Close and kill the focused core terminal |
+| `ctrl+b q` | Quit the UI and preserve core terminals |
+| `ctrl+b b` | Open the core terminal browser |
+| `ctrl+b r` | Refresh core metadata |
+
+## Boundaries
+
+Core-native mode currently targets one TUI client. It does not share layout between multiple clients, synchronize TUI layout to Herdr App, provide remote-core setup, or emulate legacy Herdr plugins. These are separate from terminal and agent persistence.

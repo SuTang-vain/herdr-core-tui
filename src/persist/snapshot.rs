@@ -461,7 +461,7 @@ fn capture_pane_history(
     Some(PaneHistorySnapshot { ansi, lines })
 }
 
-pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
+pub(crate) fn capture_node(node: &Node) -> LayoutSnapshot {
     match node {
         Node::Pane(id) => LayoutSnapshot::Pane(id.raw()),
         Node::Split {

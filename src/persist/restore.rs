@@ -959,7 +959,7 @@ pub(super) fn resolve_restored_pane(
 
 /// Restore a layout tree, remapping every pane ID to a fresh globally unique one.
 /// Returns the new tree and a map of old_raw_id → new PaneId.
-pub(super) fn restore_node_remapped(snap: &LayoutSnapshot) -> (Node, HashMap<u32, PaneId>) {
+pub(crate) fn restore_node_remapped(snap: &LayoutSnapshot) -> (Node, HashMap<u32, PaneId>) {
     let mut id_map = HashMap::new();
     let node = remap_inner(snap, &mut id_map);
     (node, id_map)

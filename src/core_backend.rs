@@ -25,6 +25,9 @@ pub(crate) fn configure(backend: crate::config::TerminalBackendConfig) {
 }
 
 fn enabled(command: &CommandBuilder) -> bool {
+    if std::env::var("HERDR_CORE_MODE").is_ok_and(|mode| mode == "native") {
+        return false;
+    }
     CORE_CONFIGURED.load(Ordering::Acquire)
         || command
             .get_env(BACKEND_ENV_VAR)

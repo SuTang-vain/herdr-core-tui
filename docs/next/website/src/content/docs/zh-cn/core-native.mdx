@@ -1,0 +1,56 @@
+---
+title: Core-native 模式
+description: 不启动 Herdr server，让 Herdr TUI 直接连接 herdr-core。
+---
+
+Core-native 模式让 `herdr` 成为现有 herdr-core 实例的终端客户端。Herdr Core 拥有 agent 进程和真实 PTY；TUI client 管理展示状态。
+
+## 直接连接 core
+
+启用 core backend：
+
+```toml
+[terminal]
+backend = "herdr-core"
+```
+
+运行 `herdr` 会直接发现 core terminals。它不会启动 Herdr server、创建旧 Herdr socket，也不会读写旧 `session.json`。core 不可用时会明确报错，不会回退到 Herdr server。
+
+`HERDR_CORE_CLI` 指定 `hc` 可执行文件。`HERDR_CORE_MODE=native` 强制 native 模式；`HERDR_CORE_MODE=host` 仅用于对照或恢复时选择旧 host bridge。
+
+## 布局与持久化
+
+Workspace、tab、pane、focus、分屏比例和 zoom 由 client 管理。每个 pane 对应一个 core terminal 地址。映射保存在配置目录旁的 `core-native-session.json`，与旧 server 状态分离。
+
+关闭并重开 TUI 会以相同地址 reattach 存活 terminal，不创建替代实例。已结束 terminal 保留位置和地址。丢失的 terminal 会显示 missing，不会被静默重建。
+
+用 `ctrl+b q` 退出 UI 会保留 core terminals。用 `ctrl+b x` 显式关闭 pane 会 kill 存活的对应 core terminal 并删除映射。关闭最后一个 pane 会退出 client。
+
+## Agent 状态与恢复
+
+Client 订阅 core 事件，显示 core 上报的 agent、working、完成状态和 turn 信息，不根据本地 `hc attach` 进程猜测 core agent 状态。
+
+core terminal 的 Kimi session 记录提供 session id 和 resume argv。在带有记录的已结束 pane 上按 Enter，会在同一 cwd 创建新 core terminal 并执行 `kimi --session <id>`。新 terminal 带有记录旧地址的 `herdr.resumed-from` 标签。没有记录的 finished pane 不会启动新会话。
+
+## 快捷键
+
+Core-native 模式使用熟悉的 prefix 操作：
+
+| 快捷键 | 操作 |
+| --- | --- |
+| `ctrl+b v` / `ctrl+b -` | 向右 / 向下分屏 |
+| `ctrl+b` + 方向键 | 聚焦相邻 pane |
+| `ctrl+b shift+h/j/k/l` | 向指定方向 swap |
+| `ctrl+b m` + 方向键 | 向指定方向 move |
+| `ctrl+b z` | 切换 zoom |
+| `ctrl+b c` / `ctrl+b shift+n` | 新 tab / workspace |
+| `ctrl+b n` / `ctrl+b p` | 下一个 / 上一个 tab |
+| `ctrl+b ]` / `ctrl+b [` | 下一个 / 上一个 workspace |
+| `ctrl+b x` | 关闭并 kill 当前 core terminal |
+| `ctrl+b q` | 退出 UI 并保留 core terminals |
+| `ctrl+b b` | 打开 core terminal 浏览器 |
+| `ctrl+b r` | 刷新 core 元数据 |
+
+## 边界
+
+Core-native 当前面向单个 TUI client，不支持多 client 共享布局、向 Herdr App 同步 TUI 布局、远程 core 配置或旧 Herdr 插件模拟。这些与 terminal 和 agent 持久化是相互独立的能力。

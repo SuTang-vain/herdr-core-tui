@@ -22,6 +22,7 @@ mod client;
 mod config;
 mod copy_mode;
 mod core_backend;
+mod core_native;
 mod detect;
 mod events;
 use ghostty_vt as ghostty;
@@ -800,6 +801,14 @@ fn main() -> io::Result<()> {
 
     let loaded_config = config::Config::load();
     exit_if_nested_disabled(&loaded_config.config);
+
+    if core_native::requested(&loaded_config.config) {
+        if let Err(err) = core_native::run() {
+            eprintln!("herdr: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     let saved_federation =
         client::endpoint::EndpointCatalog::load().is_ok_and(|catalog| catalog.has_enabled_ssh());
