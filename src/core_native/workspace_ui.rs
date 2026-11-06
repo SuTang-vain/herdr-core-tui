@@ -180,6 +180,61 @@ fn tab_bar_hit(session: &CoreSession, frame: Rect, column: u16, row: u16) -> Opt
     None
 }
 
+/// Active split-border drag. The ratio is recomputed from the mouse
+/// position against the split node's total area.
+struct SplitDrag {
+    path: Vec<bool>,
+    direction: Direction,
+    area: Rect,
+}
+
+fn split_border_hit(
+    tab: &super::session::CoreTab,
+    content: Rect,
+    column: u16,
+    row: u16,
+) -> Option<SplitDrag> {
+    for border in tab.layout.splits(content) {
+        let hit = match border.direction {
+            Direction::Horizontal => {
+                column.abs_diff(border.pos) <= 1
+                    && row >= border.area.y
+                    && row < border.area.y + border.area.height
+            }
+            Direction::Vertical => {
+                row.abs_diff(border.pos) <= 1
+                    && column >= border.area.x
+                    && column < border.area.x + border.area.width
+            }
+        };
+        if hit {
+            return Some(SplitDrag {
+                path: border.path,
+                direction: border.direction,
+                area: border.area,
+            });
+        }
+    }
+    None
+}
+
+/// First blocked agent, for a persistent footer reminder while it needs input.
+fn blocked_agent(session: &CoreSession) -> Option<String> {
+    session
+        .workspaces
+        .iter()
+        .flat_map(|workspace| &workspace.tabs)
+        .flat_map(|tab| tab.panes.values())
+        .find(|pane| pane.core.status_state() == Some("blocked"))
+        .map(|pane| {
+            format!(
+                "blocked: {} {} needs an answer",
+                pane.core.address,
+                pane.core.status_app().unwrap_or("agent")
+            )
+        })
+}
+
 fn core_state_color(state: &str) -> Color {
     match state {
         "working" => Color::Yellow,
@@ -368,6 +423,11 @@ fn draw(
 
     let footer = if let Some(error) = action_error {
         Span::styled(error.to_string(), Style::default().fg(Color::Red))
+    } else if let Some(blocked) = blocked_agent(session) {
+        Span::styled(
+            blocked,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
     } else if let Some(notice) = startup_notice {
         // Informational, not an error: yellow and dismissed by first input.
         Span::styled(notice.to_string(), Style::default().fg(Color::Yellow))
@@ -592,6 +652,7 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
     };
     let mut action_error = None;
     let mut overlay: Option<Overlay> = None;
+    let mut split_drag: Option<SplitDrag> = None;
     let mut current_config = crate::config::Config::load().config;
     save_session(&session, &mut action_error);
 
@@ -933,7 +994,12 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
                                 save_session(&session, &mut action_error);
                             }
                             None => {
-                                if let Some(pane_id) =
+                                let border = session.active_tab().and_then(|tab| {
+                                    split_border_hit(tab, layout.content, mouse.column, mouse.row)
+                                });
+                                if let Some(drag) = border {
+                                    split_drag = Some(drag);
+                                } else if let Some(pane_id) =
                                     hovered_pane(&layout, mouse.column, mouse.row)
                                 {
                                     if let Some(tab) = session.active_tab_mut() {
@@ -942,6 +1008,28 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
                                     save_session(&session, &mut action_error);
                                 }
                             }
+                        }
+                    }
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                        if let Some(drag) = &split_drag {
+                            let ratio = match drag.direction {
+                                Direction::Horizontal => {
+                                    (mouse.column.saturating_sub(drag.area.x)) as f32
+                                        / drag.area.width.max(1) as f32
+                                }
+                                Direction::Vertical => {
+                                    (mouse.row.saturating_sub(drag.area.y)) as f32
+                                        / drag.area.height.max(1) as f32
+                                }
+                            };
+                            if let Some(tab) = session.active_tab_mut() {
+                                tab.layout.set_ratio_at(&drag.path, ratio);
+                            }
+                        }
+                    }
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                        if split_drag.take().is_some() {
+                            save_session(&session, &mut action_error);
                         }
                     }
                     MouseEventKind::ScrollUp => {
