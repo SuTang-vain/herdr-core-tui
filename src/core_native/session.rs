@@ -572,7 +572,7 @@ impl CoreSession {
         }
         if !derived.unorganized.is_empty() {
             session.notices.push(format!(
-                "{} core terminal(s) have no workspace labels; adopt them with ctrl+b b",
+                "{} core terminal(s) have no workspace labels; adopt them with ctrl+b a",
                 derived.unorganized.len()
             ));
         }
@@ -1023,6 +1023,19 @@ impl CoreSession {
                     runtime.resize(rows, cols, 0, 0);
                 }
                 pane.last_size = (rows, cols);
+            }
+        }
+    }
+
+    /// Scroll a pane's viewport without changing focus (mouse wheel).
+    pub fn scroll_pane(&mut self, pane_id: PaneId, delta: isize) {
+        if let Some(pane) = self.find_pane_mut(pane_id) {
+            if let Some(runtime) = &pane.runtime {
+                if delta > 0 {
+                    runtime.scroll_up(delta as usize);
+                } else if delta < 0 {
+                    runtime.scroll_down(delta.unsigned_abs());
+                }
             }
         }
     }

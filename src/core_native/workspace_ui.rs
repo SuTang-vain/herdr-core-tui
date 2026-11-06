@@ -47,6 +47,69 @@ struct ViewLayout {
     panes: Vec<PaneInfo>,
 }
 
+enum SidebarHit {
+    Workspace(usize),
+    Pane(crate::layout::PaneId),
+}
+
+/// Map a mouse position onto the sidebar rows drawn by `draw`: the `spaces`
+/// header, one row per workspace, a blank row, the `panes` header, then two
+/// rows (name + state) per visible pane.
+fn sidebar_hit(
+    session: &CoreSession,
+    layout: &ViewLayout,
+    frame: Rect,
+    column: u16,
+    row: u16,
+) -> Option<SidebarHit> {
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(frame);
+    let columns = Layout::horizontal([Constraint::Length(26), Constraint::Min(1)]).split(rows[1]);
+    let sidebar = columns[0];
+    if column < sidebar.x || column >= sidebar.x.saturating_add(sidebar.width) {
+        return None;
+    }
+    let inner_top = sidebar.y + 1;
+    if row < inner_top || row >= sidebar.y.saturating_add(sidebar.height.saturating_sub(1)) {
+        return None;
+    }
+    let line = usize::from(row - inner_top);
+    let workspace_count = session.workspaces.len();
+    if line == 0 {
+        return None; // "spaces" header
+    }
+    if line <= workspace_count {
+        return Some(SidebarHit::Workspace(line - 1));
+    }
+    let panes_header = workspace_count + 2; // blank row + "panes" header
+    if line <= panes_header || session.active_tab().is_none() {
+        return None;
+    }
+    let pane_line = line - panes_header - 1;
+    let index = pane_line / 2; // name row and state row hit the same pane
+    layout
+        .panes
+        .get(index)
+        .map(|info| SidebarHit::Pane(info.id))
+}
+
+fn hovered_pane(layout: &ViewLayout, column: u16, row: u16) -> Option<crate::layout::PaneId> {
+    layout
+        .panes
+        .iter()
+        .find(|info| {
+            column >= info.rect.x
+                && column < info.rect.x.saturating_add(info.rect.width)
+                && row >= info.rect.y
+                && row < info.rect.y.saturating_add(info.rect.height)
+        })
+        .map(|info| info.id)
+}
+
 fn view_layout(session: &CoreSession, frame: Rect) -> ViewLayout {
     let rows = Layout::vertical([
         Constraint::Length(2),
@@ -107,6 +170,7 @@ fn draw(
     prefix: bool,
     move_pending: bool,
     action_error: Option<&str>,
+    startup_notice: Option<&str>,
 ) {
     let areas = Layout::vertical([
         Constraint::Length(2),
@@ -239,6 +303,9 @@ fn draw(
 
     let footer = if let Some(error) = action_error {
         Span::styled(error.to_string(), Style::default().fg(Color::Red))
+    } else if let Some(notice) = startup_notice {
+        // Informational, not an error: yellow and dismissed by first input.
+        Span::styled(notice.to_string(), Style::default().fg(Color::Yellow))
     } else if move_pending {
         Span::styled(
             "move: choose a direction",
@@ -299,11 +366,12 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
     let mut restore = TerminalRestore { active: true };
     let mut prefix = false;
     let mut move_pending = false;
-    let mut action_error = if session.notices.is_empty() {
+    let mut startup_notice = if session.notices.is_empty() {
         None
     } else {
         Some(session.notices.join("\n"))
     };
+    let mut action_error = None;
     save_session(&session, &mut action_error);
 
     let size = terminal.size()?;
@@ -351,6 +419,7 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
                     prefix,
                     move_pending,
                     action_error.as_deref(),
+                    startup_notice.as_deref(),
                 )
             })?;
             needs_draw = false;
@@ -360,7 +429,15 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
             continue;
         }
         needs_draw = true;
-        match event::read()? {
+        let input_event = event::read()?;
+        if matches!(
+            input_event,
+            Event::Key(_) | Event::Mouse(_) | Event::Paste(_)
+        ) {
+            // The startup notice is informational; any real input dismisses it.
+            startup_notice = None;
+        }
+        match input_event {
             Event::Key(key) => {
                 if move_pending {
                     move_pending = false;
@@ -541,18 +618,47 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
                 session.send_key(key)?;
             }
             Event::Paste(text) => session.send_paste(text)?,
-            Event::Mouse(mouse)
-                if mouse.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left) =>
-            {
-                if let Some(info) = layout.panes.iter().find(|info| {
-                    mouse.column >= info.rect.x
-                        && mouse.column < info.rect.x.saturating_add(info.rect.width)
-                        && mouse.row >= info.rect.y
-                        && mouse.row < info.rect.y.saturating_add(info.rect.height)
-                }) {
-                    if let Some(tab) = session.active_tab_mut() {
-                        tab.layout.focus_pane(info.id);
+            Event::Mouse(mouse) => {
+                let size = terminal.size()?;
+                let frame = Rect::new(0, 0, size.width, size.height);
+                match mouse.kind {
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        match sidebar_hit(&session, &layout, frame, mouse.column, mouse.row) {
+                            Some(SidebarHit::Workspace(index)) => {
+                                if index < session.workspaces.len() {
+                                    session.active_workspace = index;
+                                    save_session(&session, &mut action_error);
+                                }
+                            }
+                            Some(SidebarHit::Pane(pane_id)) => {
+                                if let Some(tab) = session.active_tab_mut() {
+                                    tab.layout.focus_pane(pane_id);
+                                }
+                                save_session(&session, &mut action_error);
+                            }
+                            None => {
+                                if let Some(pane_id) =
+                                    hovered_pane(&layout, mouse.column, mouse.row)
+                                {
+                                    if let Some(tab) = session.active_tab_mut() {
+                                        tab.layout.focus_pane(pane_id);
+                                    }
+                                    save_session(&session, &mut action_error);
+                                }
+                            }
+                        }
                     }
+                    MouseEventKind::ScrollUp => {
+                        if let Some(pane_id) = hovered_pane(&layout, mouse.column, mouse.row) {
+                            session.scroll_pane(pane_id, 3);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if let Some(pane_id) = hovered_pane(&layout, mouse.column, mouse.row) {
+                            session.scroll_pane(pane_id, -3);
+                        }
+                    }
+                    _ => {}
                 }
             }
             _ => {}
