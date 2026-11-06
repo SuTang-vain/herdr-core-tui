@@ -141,6 +141,45 @@ fn view_layout(session: &CoreSession, frame: Rect) -> ViewLayout {
     ViewLayout { content, panes }
 }
 
+/// Tab strip entries for the header's second row: one per tab plus a
+/// trailing "+". `None` marks the new-tab button. Shared by drawing and
+/// mouse hit-testing so they never disagree.
+fn tab_strip(session: &CoreSession) -> Vec<(String, Option<usize>)> {
+    let mut items: Vec<(String, Option<usize>)> = session
+        .active_workspace()
+        .map(|workspace| {
+            workspace
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(index, tab)| {
+                    let name = tab.name.as_deref().unwrap_or(&tab.id);
+                    (format!(" {name} "), Some(index))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    items.push((" + ".into(), None));
+    items
+}
+
+/// Hit-test the tab strip row. Returns `Some(Some(tab))` to switch,
+/// `Some(None)` for the new-tab button.
+fn tab_bar_hit(session: &CoreSession, frame: Rect, column: u16, row: u16) -> Option<Option<usize>> {
+    if row != frame.y + 1 {
+        return None;
+    }
+    let mut x = 1u16;
+    for (label, action) in tab_strip(session) {
+        let width = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+        if column >= x && column < x + width {
+            return Some(action);
+        }
+        x += width + 1;
+    }
+    None
+}
+
 fn core_state_color(state: &str) -> Color {
     match state {
         "working" => Color::Yellow,
@@ -200,6 +239,27 @@ fn draw(
     frame.render_widget(
         Paragraph::new("[menu]").style(Style::default().fg(Color::DarkGray)),
         menu::menu_button_area(frame.area()),
+    );
+    let active_tab = session
+        .active_workspace()
+        .map(|workspace| workspace.active_tab);
+    let mut tab_spans = vec![Span::raw(" ")];
+    for (index, (label, action)) in tab_strip(session).into_iter().enumerate() {
+        if index > 0 {
+            tab_spans.push(Span::raw(" "));
+        }
+        let style = match action {
+            Some(index) if Some(index) == active_tab => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Some(_) => Style::default().fg(Color::Gray),
+            None => Style::default().fg(Color::DarkGray),
+        };
+        tab_spans.push(Span::styled(label, style));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(tab_spans)),
+        Rect::new(0, frame.area().y + 1, frame.area().width, 1),
     );
 
     let mut sidebar = Vec::new();
@@ -485,7 +545,10 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
     let discovered = discovery.enrich(discovered);
     let mut session =
         CoreSession::restore_or_create(snapshot, &discovery, context, discovered.clone())?;
-    let (_core_listener, core_events) = CoreEventListener::spawn(&discovery)?;
+    let (mut _core_listener, mut core_events) = CoreEventListener::spawn(&discovery)?;
+    // When the stream drops, retry with capped exponential backoff instead of
+    // leaving the UI frozen on the last known state.
+    let mut reconnect: Option<(std::time::Instant, std::time::Duration)> = None;
     let mut terminal = init_terminal()?;
     let mut restore = TerminalRestore { active: true };
     let mut prefix = false;
@@ -504,6 +567,24 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
     let mut layout = view_layout(&session, Rect::new(0, 0, size.width, size.height));
     let mut needs_draw = true;
     loop {
+        if let Some((when, backoff)) = reconnect {
+            if std::time::Instant::now() >= when {
+                match CoreEventListener::spawn(&discovery) {
+                    Ok((listener, receiver)) => {
+                        _core_listener = listener; // RAII: dropping the old listener kills its child
+                        core_events = receiver;
+                        reconnect = None;
+                        session.refresh_core(&discovery);
+                        startup_notice = Some("core event stream reconnected".into());
+                        needs_draw = true;
+                    }
+                    Err(_) => {
+                        let next = (backoff * 2).min(std::time::Duration::from_secs(30));
+                        reconnect = Some((std::time::Instant::now() + next, next));
+                    }
+                }
+            }
+        }
         while let Ok(event) = events.try_recv() {
             session.handle_event(event);
             needs_draw = true;
@@ -511,7 +592,11 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
         while let Ok(event) = core_events.try_recv() {
             match event {
                 CoreEvent::Disconnected(error) => {
-                    action_error = Some(error);
+                    action_error = Some(format!("{error}; reconnecting"));
+                    reconnect.get_or_insert((
+                        std::time::Instant::now() + std::time::Duration::from_secs(2),
+                        std::time::Duration::from_secs(2),
+                    ));
                     needs_draw = true;
                 }
                 CoreEvent::Heartbeat => {}
@@ -778,6 +863,27 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
                 if menu::menu_button_hit(frame, mouse) {
                     overlay = Some(Overlay::menu());
                     continue;
+                }
+                if mouse.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left) {
+                    match tab_bar_hit(&session, frame, mouse.column, mouse.row) {
+                        Some(Some(index)) => {
+                            if let Some(workspace) = session.active_workspace_mut() {
+                                if index < workspace.tabs.len() {
+                                    workspace.active_tab = index;
+                                }
+                            }
+                            save_session(&session, &mut action_error);
+                            continue;
+                        }
+                        Some(None) => {
+                            if let Err(err) = session.add_tab(&discovery) {
+                                action_error = Some(err.to_string());
+                            }
+                            save_session(&session, &mut action_error);
+                            continue;
+                        }
+                        None => {}
+                    }
                 }
                 match mouse.kind {
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
