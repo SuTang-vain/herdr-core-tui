@@ -495,6 +495,26 @@ fn apply_overlay_outcome(
                 MenuAction::ReloadConfig => {
                     reload_config(current_config, action_error, startup_notice)
                 }
+                MenuAction::RenameWorkspace => {
+                    let current = session
+                        .active_workspace()
+                        .and_then(|workspace| workspace.name.clone())
+                        .unwrap_or_default();
+                    *overlay = Some(Overlay::Rename {
+                        workspace: true,
+                        input: current,
+                    });
+                }
+                MenuAction::RenameTab => {
+                    let current = session
+                        .active_tab()
+                        .and_then(|tab| tab.name.clone())
+                        .unwrap_or_default();
+                    *overlay = Some(Overlay::Rename {
+                        workspace: false,
+                        input: current,
+                    });
+                }
                 MenuAction::Adopt => {
                     adopt_flow(
                         discovery,
@@ -533,6 +553,18 @@ fn apply_overlay_outcome(
                     }
                 }
             }
+        }
+        OverlayOutcome::SubmitRename { workspace, name } => {
+            *overlay = None;
+            let result = if workspace {
+                session.rename_active_workspace(discovery, name)
+            } else {
+                session.rename_active_tab(discovery, name)
+            };
+            if let Err(err) = result {
+                *action_error = Some(err.to_string());
+            }
+            save_session(session, action_error);
         }
     }
     Ok(false)

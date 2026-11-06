@@ -944,6 +944,70 @@ impl CoreSession {
         })
     }
 
+    /// Rename the active workspace and propagate the shared `where` label to
+    /// every live terminal it contains, so other core clients see the name.
+    pub fn rename_active_workspace(
+        &mut self,
+        discovery: &CoreDiscovery,
+        name: String,
+    ) -> io::Result<()> {
+        if name.is_empty() {
+            return Err(io::Error::other("workspace name cannot be empty"));
+        }
+        let workspace = self
+            .active_workspace_mut()
+            .ok_or_else(|| io::Error::other("no active workspace"))?;
+        workspace.name = Some(name);
+        self.sync_where_labels(discovery, false);
+        Ok(())
+    }
+
+    pub fn rename_active_tab(&mut self, discovery: &CoreDiscovery, name: String) -> io::Result<()> {
+        if name.is_empty() {
+            return Err(io::Error::other("tab name cannot be empty"));
+        }
+        let tab = self
+            .active_tab_mut()
+            .ok_or_else(|| io::Error::other("no active tab"))?;
+        tab.name = Some(name);
+        self.sync_where_labels(discovery, true);
+        Ok(())
+    }
+
+    /// Rewrite `where` on live terminals so the workspace/tab names stay
+    /// consistent across core clients. Label failures degrade to notices.
+    fn sync_where_labels(&mut self, discovery: &CoreDiscovery, only_active_tab: bool) {
+        let mut updates: Vec<(String, String)> = Vec::new();
+        if let Some(workspace) = self.active_workspace() {
+            let workspace_name = workspace
+                .name
+                .clone()
+                .unwrap_or_else(|| workspace.id.clone());
+            let tabs: Vec<&CoreTab> = if only_active_tab {
+                workspace.active_tab().into_iter().collect()
+            } else {
+                workspace.tabs.iter().collect()
+            };
+            for tab in tabs {
+                let tab_name = tab.name.clone().unwrap_or_else(|| tab.id.clone());
+                let label = format!("{WHERE_LABEL}={workspace_name} / {tab_name}");
+                for pane in tab.panes.values() {
+                    if pane.core.state.as_deref() == Some("live") {
+                        updates.push((pane.core.address.clone(), label.clone()));
+                    }
+                }
+            }
+        }
+        for (address, label) in updates {
+            if let Err(err) = discovery.set_labels(&address, std::slice::from_ref(&label)) {
+                self.notices
+                    .push(format!("could not rename labels on {address}: {err}"));
+            } else if let Some(pane) = self.find_pane_by_address(&address) {
+                pane.core.labels.insert(WHERE_LABEL.into(), label);
+            }
+        }
+    }
+
     pub fn toggle_zoom(&mut self) {
         if let Some(tab) = self.active_tab_mut() {
             tab.zoomed = !tab.zoomed;

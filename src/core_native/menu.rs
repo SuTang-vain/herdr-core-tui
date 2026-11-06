@@ -17,6 +17,8 @@ pub(crate) enum MenuAction {
     ReloadConfig,
     Adopt,
     Detach,
+    RenameWorkspace,
+    RenameTab,
     /// Only reachable from the settings overlay, not the menu list.
     EditConfig,
 }
@@ -26,14 +28,17 @@ const MENU_ITEMS: &[(&str, MenuAction)] = &[
     ("keybinds", MenuAction::Keybinds),
     ("reload config", MenuAction::ReloadConfig),
     ("adopt terminal", MenuAction::Adopt),
+    ("rename workspace", MenuAction::RenameWorkspace),
+    ("rename tab", MenuAction::RenameTab),
     ("detach", MenuAction::Detach),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Overlay {
     Menu { highlighted: usize },
     Keybinds,
     Settings,
+    Rename { workspace: bool, input: String },
 }
 
 impl Overlay {
@@ -65,6 +70,22 @@ impl Overlay {
             Self::Settings => match code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => OverlayOutcome::Close,
                 KeyCode::Char('e') => OverlayOutcome::Run(MenuAction::EditConfig),
+                _ => OverlayOutcome::Keep,
+            },
+            Self::Rename { workspace, input } => match code {
+                KeyCode::Esc => OverlayOutcome::Close,
+                KeyCode::Enter => OverlayOutcome::SubmitRename {
+                    workspace: *workspace,
+                    name: input.trim().to_string(),
+                },
+                KeyCode::Backspace => {
+                    input.pop();
+                    OverlayOutcome::Keep
+                }
+                KeyCode::Char(character) => {
+                    input.push(character);
+                    OverlayOutcome::Keep
+                }
                 _ => OverlayOutcome::Keep,
             },
         }
@@ -116,11 +137,12 @@ impl Overlay {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OverlayOutcome {
     Keep,
     Close,
     Run(MenuAction),
+    SubmitRename { workspace: bool, name: String },
 }
 
 /// The clickable `[menu]` label in the header row.
@@ -147,9 +169,10 @@ pub(crate) fn menu_button_hit(frame: Rect, mouse: MouseEvent) -> bool {
 
 fn overlay_area(overlay: &Overlay, frame: Rect) -> Rect {
     let (width, height) = match overlay {
-        Overlay::Menu { .. } => (24u16, MENU_ITEMS.len() as u16 + 2),
+        Overlay::Menu { .. } => (26u16, MENU_ITEMS.len() as u16 + 2),
         Overlay::Keybinds => (64, 24),
         Overlay::Settings => (72, 20),
+        Overlay::Rename { .. } => (52, 5),
     };
     let width = width.min(frame.width);
     let height = height.min(frame.height);
@@ -208,6 +231,25 @@ pub(crate) fn draw(frame: &mut ratatui::Frame, overlay: &Overlay, settings_lines
                 Paragraph::new(lines)
                     .block(Block::bordered().title(" settings "))
                     .wrap(Wrap { trim: false }),
+                area,
+            );
+        }
+        Overlay::Rename { workspace, input } => {
+            let title = if *workspace {
+                " rename workspace "
+            } else {
+                " rename tab "
+            };
+            let lines = vec![
+                Line::from(format!(" {input}▏")),
+                Line::from(""),
+                Line::from(Span::styled(
+                    " enter applies · esc cancels · updates core labels",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            frame.render_widget(
+                Paragraph::new(lines).block(Block::bordered().title(title)),
                 area,
             );
         }
