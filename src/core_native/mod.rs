@@ -6,6 +6,7 @@
 
 mod discovery;
 mod events;
+mod menu;
 mod resume;
 mod session;
 mod store;

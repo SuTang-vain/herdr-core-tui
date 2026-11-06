@@ -13,6 +13,7 @@ use crate::layout::{NavDirection, PaneInfo};
 
 use super::discovery::{CoreDiscovery, CoreTerminal};
 use super::events::{CoreEvent, CoreEventListener};
+use super::menu::{self, MenuAction, Overlay, OverlayOutcome};
 use super::session::{CoreRuntimeContext, CoreSession};
 use super::store;
 
@@ -196,6 +197,10 @@ fn draw(
         ])),
         areas[0],
     );
+    frame.render_widget(
+        Paragraph::new("[menu]").style(Style::default().fg(Color::DarkGray)),
+        menu::menu_button_area(frame.area()),
+    );
 
     let mut sidebar = Vec::new();
     sidebar.push(Line::from(Span::styled(
@@ -325,6 +330,58 @@ fn draw(
     frame.render_widget(Paragraph::new(Line::from(footer)), areas[2]);
 }
 
+fn reload_config(
+    current_config: &mut crate::config::Config,
+    action_error: &mut Option<String>,
+    startup_notice: &mut Option<String>,
+) {
+    let loaded = crate::config::Config::load();
+    if !loaded.diagnostics.is_empty() {
+        *action_error = Some(format!(
+            "config reload reported: {}",
+            loaded.diagnostics.join("; ")
+        ));
+        return;
+    }
+    crate::core_backend::configure(loaded.config.terminal.backend);
+    *current_config = loaded.config;
+    *action_error = None;
+    *startup_notice = Some("config reloaded".into());
+}
+
+/// Shared by ctrl+b a and the menu's adopt action.
+fn adopt_flow(
+    discovery: &CoreDiscovery,
+    discovered: &[CoreTerminal],
+    session: &mut CoreSession,
+    terminal: &mut ratatui::DefaultTerminal,
+    restore: &mut TerminalRestore,
+    action_error: &mut Option<String>,
+) -> io::Result<()> {
+    let terminals = discovery.discover().unwrap_or_else(|_| discovered.to_vec());
+    let mut candidates: Vec<CoreTerminal> = terminals
+        .into_iter()
+        .filter(|core| {
+            core.state.as_deref() == Some("live") && !session.has_core_terminal(&core.address)
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.address.cmp(&b.address));
+    restore.suspend();
+    let choice = super::ui::pick_adopt(&candidates);
+    *terminal = init_terminal()?;
+    restore.active = true;
+    match choice {
+        Ok(Some(core)) => {
+            if let Err(err) = session.adopt_terminal(discovery, core) {
+                *action_error = Some(err.to_string());
+            }
+        }
+        Ok(None) => {}
+        Err(err) => *action_error = Some(err.to_string()),
+    }
+    Ok(())
+}
+
 fn save_session(session: &CoreSession, action_error: &mut Option<String>) {
     if let Err(err) = session.save() {
         *action_error = Some(format!("could not save core-native layout: {err}"));
@@ -354,6 +411,73 @@ fn open_browser(
     Ok(())
 }
 
+/// Apply an overlay outcome. Returns `Ok(true)` when the client should exit.
+fn apply_overlay_outcome(
+    outcome: OverlayOutcome,
+    overlay: &mut Option<Overlay>,
+    session: &mut CoreSession,
+    discovery: &CoreDiscovery,
+    discovered: &[CoreTerminal],
+    terminal: &mut ratatui::DefaultTerminal,
+    restore: &mut TerminalRestore,
+    action_error: &mut Option<String>,
+    startup_notice: &mut Option<String>,
+    current_config: &mut crate::config::Config,
+) -> io::Result<bool> {
+    match outcome {
+        OverlayOutcome::Keep => {}
+        OverlayOutcome::Close => *overlay = None,
+        OverlayOutcome::Run(action) => {
+            *overlay = None;
+            match action {
+                MenuAction::Settings => *overlay = Some(Overlay::Settings),
+                MenuAction::Keybinds => *overlay = Some(Overlay::Keybinds),
+                MenuAction::ReloadConfig => {
+                    reload_config(current_config, action_error, startup_notice)
+                }
+                MenuAction::Adopt => {
+                    adopt_flow(
+                        discovery,
+                        discovered,
+                        session,
+                        terminal,
+                        restore,
+                        action_error,
+                    )?;
+                    save_session(session, action_error);
+                }
+                MenuAction::Detach => {
+                    save_session(session, action_error);
+                    return Ok(true);
+                }
+                MenuAction::EditConfig => {
+                    restore.suspend();
+                    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
+                    let mut parts = editor.split_whitespace();
+                    let status = if let Some(program) = parts.next() {
+                        std::process::Command::new(program)
+                            .args(parts)
+                            .arg(crate::config::config_path())
+                            .status()
+                    } else {
+                        Err(io::Error::other("EDITOR is empty"))
+                    };
+                    *terminal = init_terminal()?;
+                    restore.active = true;
+                    match status {
+                        Ok(status) if status.success() => {
+                            reload_config(current_config, action_error, startup_notice)
+                        }
+                        Ok(status) => *action_error = Some(format!("editor exited with {status}")),
+                        Err(err) => *action_error = Some(format!("could not run $EDITOR: {err}")),
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io::Result<()> {
     let (context, mut events) = CoreRuntimeContext::new();
     let render_dirty = context.render_dirty();
@@ -372,6 +496,8 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
         Some(session.notices.join("\n"))
     };
     let mut action_error = None;
+    let mut overlay: Option<Overlay> = None;
+    let mut current_config = crate::config::Config::load().config;
     save_session(&session, &mut action_error);
 
     let size = terminal.size()?;
@@ -420,7 +546,10 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
                     move_pending,
                     action_error.as_deref(),
                     startup_notice.as_deref(),
-                )
+                );
+                if let Some(current) = &overlay {
+                    menu::draw(frame, current, &menu::settings_lines(&current_config));
+                }
             })?;
             needs_draw = false;
         }
@@ -439,6 +568,26 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
         }
         match input_event {
             Event::Key(key) => {
+                if let Some(current) = overlay.as_mut() {
+                    if key.kind == KeyEventKind::Press {
+                        let outcome = current.handle_key(key.code);
+                        if apply_overlay_outcome(
+                            outcome,
+                            &mut overlay,
+                            &mut session,
+                            &discovery,
+                            &discovered,
+                            &mut terminal,
+                            &mut restore,
+                            &mut action_error,
+                            &mut startup_notice,
+                            &mut current_config,
+                        )? {
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
                 if move_pending {
                     move_pending = false;
                     if let Some(direction) = direction_for_key(key.code) {
@@ -479,29 +628,14 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
                             save_session(&session, &mut action_error);
                         }
                         KeyCode::Char('a') => {
-                            let terminals =
-                                discovery.discover().unwrap_or_else(|_| discovered.clone());
-                            let mut candidates: Vec<CoreTerminal> = terminals
-                                .into_iter()
-                                .filter(|core| {
-                                    core.state.as_deref() == Some("live")
-                                        && !session.has_core_terminal(&core.address)
-                                })
-                                .collect();
-                            candidates.sort_by(|a, b| a.address.cmp(&b.address));
-                            restore.suspend();
-                            let choice = super::ui::pick_adopt(&candidates);
-                            terminal = init_terminal()?;
-                            restore.active = true;
-                            match choice {
-                                Ok(Some(core)) => {
-                                    if let Err(err) = session.adopt_terminal(&discovery, core) {
-                                        action_error = Some(err.to_string());
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(err) => action_error = Some(err.to_string()),
-                            }
+                            adopt_flow(
+                                &discovery,
+                                &discovered,
+                                &mut session,
+                                &mut terminal,
+                                &mut restore,
+                                &mut action_error,
+                            )?;
                             save_session(&session, &mut action_error);
                         }
                         KeyCode::Char('v') => {
@@ -561,6 +695,7 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
                             save_session(&session, &mut action_error);
                         }
                         KeyCode::Char('r') => session.refresh_core(&discovery),
+                        KeyCode::Char('g') => overlay = Some(Overlay::menu()),
                         KeyCode::Char('m') => move_pending = true,
                         KeyCode::Char('b') => {
                             save_session(&session, &mut action_error);
@@ -621,6 +756,29 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
             Event::Mouse(mouse) => {
                 let size = terminal.size()?;
                 let frame = Rect::new(0, 0, size.width, size.height);
+                if let Some(current) = overlay.as_mut() {
+                    if let Some(outcome) = current.handle_mouse(mouse, frame) {
+                        if apply_overlay_outcome(
+                            outcome,
+                            &mut overlay,
+                            &mut session,
+                            &discovery,
+                            &discovered,
+                            &mut terminal,
+                            &mut restore,
+                            &mut action_error,
+                            &mut startup_notice,
+                            &mut current_config,
+                        )? {
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+                if menu::menu_button_hit(frame, mouse) {
+                    overlay = Some(Overlay::menu());
+                    continue;
+                }
                 match mouse.kind {
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                         match sidebar_hit(&session, &layout, frame, mouse.column, mouse.row) {
