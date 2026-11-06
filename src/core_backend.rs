@@ -28,10 +28,22 @@ fn enabled(command: &CommandBuilder) -> bool {
     if std::env::var("HERDR_CORE_MODE").is_ok_and(|mode| mode == "native") {
         return false;
     }
-    CORE_CONFIGURED.load(Ordering::Acquire)
-        || command
+    // Unit tests share one process: a global flag configured by an unrelated
+    // App must not rewrite another test's pane commands. Tests opt in per
+    // command with HERDR_BACKEND=herdr-core instead.
+    #[cfg(test)]
+    {
+        return command
             .get_env(BACKEND_ENV_VAR)
-            .is_some_and(|value| value == CORE_BACKEND)
+            .is_some_and(|value| value == CORE_BACKEND);
+    }
+    #[cfg(not(test))]
+    {
+        CORE_CONFIGURED.load(Ordering::Acquire)
+            || command
+                .get_env(BACKEND_ENV_VAR)
+                .is_some_and(|value| value == CORE_BACKEND)
+    }
 }
 
 fn core_cli() -> OsString {

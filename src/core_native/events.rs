@@ -11,6 +11,11 @@ use super::discovery::{CoreDiscovery, CoreTerminal};
 pub(crate) enum CoreEvent {
     Snapshot(Vec<CoreTerminal>),
     Changed(CoreChange),
+    /// Keepalive; carries no terminal facts and must not surface as an error.
+    Heartbeat,
+    /// Core emitted `missed`: the subscriber fell behind. Refresh terminals
+    /// instead of treating this as a disconnect.
+    ResyncNeeded,
     Disconnected(String),
 }
 
@@ -27,8 +32,10 @@ struct EventEnvelope {
     terminals: Option<Vec<CoreTerminal>>,
     #[serde(default)]
     method: Option<String>,
+    /// Parsed lazily: heartbeats and other methods carry params without the
+    /// terminal fields required by `EventParams`.
     #[serde(default)]
-    params: Option<EventParams>,
+    params: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -45,16 +52,21 @@ fn parse_event(line: &str) -> Option<CoreEvent> {
     if let Some(terminals) = envelope.terminals {
         return Some(CoreEvent::Snapshot(terminals));
     }
+    match envelope.method.as_deref() {
+        // Keepalives carry no terminal facts; they are not errors.
+        Some("heartbeat") => return Some(CoreEvent::Heartbeat),
+        Some("missed") => return Some(CoreEvent::ResyncNeeded),
+        _ => {}
+    }
     if envelope.method.as_deref() != Some("event") {
         return None;
     }
-    envelope.params.map(|params| {
-        CoreEvent::Changed(CoreChange {
-            kind: params.kind,
-            address: params.terminal,
-            data: params.data,
-        })
-    })
+    let params: EventParams = serde_json::from_value(envelope.params?).ok()?;
+    Some(CoreEvent::Changed(CoreChange {
+        kind: params.kind,
+        address: params.terminal,
+        data: params.data,
+    }))
 }
 
 pub(crate) struct CoreEventListener {
@@ -149,5 +161,19 @@ mod tests {
         assert_eq!(change.kind, "status");
         assert_eq!(change.address, "t1");
         assert_eq!(change.data["state"], "working");
+    }
+
+    #[test]
+    fn heartbeat_is_a_keepalive_and_missed_requests_resync() {
+        assert!(matches!(
+            parse_event(r#"{"jsonrpc":"2.0","method":"heartbeat","params":{"seq":3635}}"#),
+            Some(CoreEvent::Heartbeat)
+        ));
+        assert!(matches!(
+            parse_event(r#"{"jsonrpc":"2.0","method":"missed","params":{"seq":9}}"#),
+            Some(CoreEvent::ResyncNeeded)
+        ));
+        assert!(parse_event(r#"{"jsonrpc":"2.0","method":"event","params":{"type":"status","terminal":"t1","data":{"state":"idle"}}}"#)
+            .is_some());
     }
 }

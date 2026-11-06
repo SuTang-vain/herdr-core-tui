@@ -13,13 +13,109 @@ use crate::persist::{capture_node, restore_node_remapped};
 use crate::render_signal::RenderSignal;
 use crate::terminal::TerminalRuntime;
 
-use super::discovery::{CoreDiscovery, CoreTerminal};
+use super::discovery::{CoreDiscovery, CoreTerminal, SPACE_LABEL, TAB_LABEL, WHERE_LABEL};
 use super::events::{CoreChange, CoreEvent};
 use super::resume;
 use super::store::{
     CorePaneSnapshot, CoreSessionSnapshot, CoreTabSnapshot, CoreWorkspaceSnapshot,
     CORE_NATIVE_STORE_VERSION,
 };
+
+/// Group live core terminals into workspace/tab skeletons using the
+/// `herdr.space`/`herdr.tab`/`where` labels shared with other core clients.
+/// Terminals without labels are collected separately for later adoption.
+#[derive(Default)]
+struct CoreDerivedLayout {
+    workspaces: Vec<DerivedWorkspace>,
+    unorganized: Vec<CoreTerminal>,
+}
+
+struct DerivedWorkspace {
+    id: String,
+    name: Option<String>,
+    tabs: Vec<DerivedTab>,
+}
+
+struct DerivedTab {
+    id: String,
+    name: Option<String>,
+    terminals: Vec<CoreTerminal>,
+}
+
+impl CoreDerivedLayout {
+    fn is_empty(&self) -> bool {
+        self.workspaces.is_empty()
+    }
+
+    fn derive(terminals: Vec<CoreTerminal>) -> Self {
+        let mut derived = Self::default();
+        for core in terminals {
+            if core.state.as_deref() != Some("live") {
+                continue;
+            }
+            let Some(space) = core.space_label() else {
+                derived.unorganized.push(core);
+                continue;
+            };
+            let Some(tab_label) = core.tab_label() else {
+                derived.unorganized.push(core);
+                continue;
+            };
+            let (where_space, where_tab) = core
+                .where_parts()
+                .map(|(w, t)| (Some(w), Some(t)))
+                .unwrap_or((None, None));
+            let workspace = match derived
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id == space)
+            {
+                Some(workspace) => workspace,
+                None => {
+                    derived.workspaces.push(DerivedWorkspace {
+                        id: space.to_string(),
+                        name: where_space,
+                        tabs: Vec::new(),
+                    });
+                    derived.workspaces.last_mut().expect("just pushed")
+                }
+            };
+            let tab = match workspace.tabs.iter_mut().find(|tab| tab.id == tab_label) {
+                Some(tab) => tab,
+                None => {
+                    workspace.tabs.push(DerivedTab {
+                        id: tab_label.to_string(),
+                        name: where_tab,
+                        terminals: Vec::new(),
+                    });
+                    workspace.tabs.last_mut().expect("just pushed")
+                }
+            };
+            tab.terminals.push(core);
+        }
+        derived
+    }
+
+    /// Build a minimal flat layout for one tab's terminals, splitting to the
+    /// right of the previous pane. Returns None when the tab has no panes.
+    fn build_tab(id: String, name: Option<String>, count: usize) -> Option<(CoreTab, Vec<PaneId>)> {
+        if count == 0 {
+            return None;
+        }
+        let (mut tab, root) = CoreTab::new(id);
+        tab.name = name;
+        let mut ids = vec![root];
+        let mut previous = root;
+        for _ in 1..count {
+            let Some(id) = tab.layout.split_pane(previous, Direction::Horizontal, 0.5) else {
+                break;
+            };
+            ids.push(id);
+            previous = id;
+        }
+        Some((tab, ids))
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct CoreRuntimeContext {
@@ -189,6 +285,28 @@ impl CorePane {
         Ok(())
     }
 
+    fn adopt(
+        pane_id: PaneId,
+        core: CoreTerminal,
+        discovery: &CoreDiscovery,
+        context: &CoreRuntimeContext,
+    ) -> (Self, Option<String>) {
+        let cwd = core
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let snapshot = CorePaneSnapshot {
+            core_address: core.address.clone(),
+            cwd,
+            agent_session: None,
+        };
+        let (mut pane, notice) = Self::restore(pane_id, snapshot, discovery, context);
+        // Adopted terminals keep their organization; record it for the store.
+        pane.core = core;
+        (pane, notice)
+    }
+
     fn resume(
         &mut self,
         pane_id: PaneId,
@@ -327,6 +445,44 @@ pub(crate) struct CoreSession {
     context: CoreRuntimeContext,
 }
 
+/// Organization shared with other core clients through terminal labels.
+#[derive(Default)]
+struct CoreOrganization {
+    labels: HashMap<String, Vec<String>>,
+}
+
+impl CoreOrganization {
+    fn record(&mut self, address: &str, core: &CoreTerminal) {
+        let mut labels = Vec::new();
+        if let Some(space) = core.space_label() {
+            labels.push(format!("{SPACE_LABEL}={space}"));
+        }
+        if let Some(tab) = core.tab_label() {
+            labels.push(format!("{TAB_LABEL}={tab}"));
+        }
+        if let Some(value) = core.labels.get(WHERE_LABEL) {
+            labels.push(format!("{WHERE_LABEL}={value}"));
+        }
+        if !labels.is_empty() {
+            self.labels.insert(address.to_string(), labels);
+        }
+    }
+
+    /// Fill in labels from the workspace/tab that owns the pane. Keeps an
+    /// already-recorded `where` name when it exists.
+    fn for_new_pane(&self, workspace: &CoreWorkspace, tab: &CoreTab) -> Vec<String> {
+        vec![
+            format!("{SPACE_LABEL}={}", workspace.id),
+            format!("{TAB_LABEL}={}", tab.id),
+            format!(
+                "{WHERE_LABEL}={} / {}",
+                workspace.name.as_deref().unwrap_or(&workspace.id),
+                tab.name.as_deref().unwrap_or(&tab.id)
+            ),
+        ]
+    }
+}
+
 impl CoreSession {
     pub fn active_workspace(&self) -> Option<&CoreWorkspace> {
         self.workspaces.get(self.active_workspace)
@@ -358,6 +514,7 @@ impl CoreSession {
         snapshot: CoreSessionSnapshot,
         discovery: &CoreDiscovery,
         context: CoreRuntimeContext,
+        live_terminals: Vec<CoreTerminal>,
     ) -> io::Result<Self> {
         if snapshot.version > CORE_NATIVE_STORE_VERSION {
             return Err(io::Error::new(
@@ -402,8 +559,22 @@ impl CoreSession {
             }
             session.workspaces.push(restored_workspace);
         }
+        let mut derived = CoreDerivedLayout::derive(live_terminals);
+        if session.workspaces.is_empty() && !derived.is_empty() {
+            // The store is empty (fresh start or never organized): rebuild the
+            // whole view from the labels other core clients already wrote.
+            session.build_derived(&derived, discovery)?;
+        } else {
+            session.merge_derived(&mut derived, discovery);
+        }
         if session.workspaces.is_empty() {
             session.add_workspace(discovery, std::env::current_dir()?)?;
+        }
+        if !derived.unorganized.is_empty() {
+            session.notices.push(format!(
+                "{} core terminal(s) have no workspace labels; adopt them with ctrl+b b",
+                derived.unorganized.len()
+            ));
         }
         session.active_workspace = session
             .active_workspace
@@ -411,16 +582,159 @@ impl CoreSession {
         Ok(session)
     }
 
+    fn build_derived(
+        &mut self,
+        derived: &CoreDerivedLayout,
+        discovery: &CoreDiscovery,
+    ) -> io::Result<()> {
+        for workspace in &derived.workspaces {
+            let cwd = workspace
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.terminals)
+                .find_map(|core| core.cwd.as_deref().map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let mut restored = CoreWorkspace::new(workspace.id.clone(), cwd);
+            restored.name = workspace.name.clone();
+            for tab in &workspace.tabs {
+                let Some((mut new_tab, ids)) = CoreDerivedLayout::build_tab(
+                    tab.id.clone(),
+                    tab.name.clone(),
+                    tab.terminals.len(),
+                ) else {
+                    continue;
+                };
+                for (pane_id, core) in ids.into_iter().zip(tab.terminals.iter().cloned()) {
+                    let (pane, notice) = CorePane::adopt(pane_id, core, discovery, &self.context);
+                    new_tab.panes.insert(pane_id, pane);
+                    self.notices.extend(notice);
+                }
+                restored.tabs.push(new_tab);
+            }
+            if !restored.tabs.is_empty() {
+                self.workspaces.push(restored);
+            }
+        }
+        Ok(())
+    }
+
+    /// Add core terminals that appeared after the local snapshot was saved.
+    /// Existing panes keep their positions; only unknown addresses are added.
+    fn merge_derived(&mut self, derived: &mut CoreDerivedLayout, discovery: &CoreDiscovery) {
+        let mut organization = CoreOrganization::default();
+        for workspace in derived.workspaces.drain(..) {
+            let cwd = workspace
+                .tabs
+                .iter()
+                .flat_map(|tab| &tab.terminals)
+                .find_map(|core| core.cwd.as_deref().map(PathBuf::from))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let workspace_index = match self
+                .workspaces
+                .iter_mut()
+                .enumerate()
+                .find(|(_, existing)| existing.id == workspace.id)
+            {
+                Some((index, existing)) => {
+                    if existing.name.is_none() {
+                        existing.name = workspace.name.clone();
+                    }
+                    index
+                }
+                None => {
+                    let mut created = CoreWorkspace::new(workspace.id.clone(), cwd);
+                    created.name = workspace.name.clone();
+                    self.workspaces.push(created);
+                    self.workspaces.len() - 1
+                }
+            };
+            for tab in workspace.tabs {
+                let new_terminals: Vec<CoreTerminal> = tab
+                    .terminals
+                    .into_iter()
+                    .filter(|core| {
+                        if self.find_pane_by_address(&core.address).is_some() {
+                            return false;
+                        }
+                        organization.record(&core.address, core);
+                        true
+                    })
+                    .collect();
+                if new_terminals.is_empty() {
+                    continue;
+                }
+                let target = self.workspaces[workspace_index]
+                    .tabs
+                    .iter_mut()
+                    .find(|existing| existing.id == tab.id);
+                match target {
+                    Some(existing) => {
+                        if existing.name.is_none() {
+                            existing.name = tab.name.clone();
+                        }
+                        let mut previous = existing.layout.focused();
+                        for core in new_terminals {
+                            let Some(pane_id) =
+                                existing
+                                    .layout
+                                    .split_pane(previous, Direction::Horizontal, 0.5)
+                            else {
+                                continue;
+                            };
+                            let (pane, notice) =
+                                CorePane::adopt(pane_id, core, discovery, &self.context);
+                            existing.panes.insert(pane_id, pane);
+                            self.notices.extend(notice);
+                            previous = pane_id;
+                        }
+                    }
+                    None => {
+                        let Some((mut new_tab, ids)) = CoreDerivedLayout::build_tab(
+                            tab.id.clone(),
+                            tab.name.clone(),
+                            new_terminals.len(),
+                        ) else {
+                            continue;
+                        };
+                        for (pane_id, core) in ids.into_iter().zip(new_terminals) {
+                            let (pane, notice) =
+                                CorePane::adopt(pane_id, core, discovery, &self.context);
+                            new_tab.panes.insert(pane_id, pane);
+                            self.notices.extend(notice);
+                        }
+                        self.workspaces[workspace_index].tabs.push(new_tab);
+                    }
+                }
+            }
+        }
+        for (address, labels) in organization.labels.drain() {
+            self.label_created(discovery, &address, labels);
+        }
+    }
+
     pub fn add_workspace(&mut self, discovery: &CoreDiscovery, cwd: PathBuf) -> io::Result<()> {
         let id = format!("w{}", PaneId::alloc().raw());
         let mut workspace = CoreWorkspace::new(id, cwd.clone());
         let (tab, root) = CoreTab::new(format!("t{}", PaneId::alloc().raw()));
-        workspace.tabs.push(tab);
         let pane = CorePane::create(root, cwd, discovery, &self.context)?;
+        let labels = CoreOrganization::default().for_new_pane(&workspace, &tab);
+        workspace.tabs.push(tab);
         workspace.tabs[0].panes.insert(root, pane);
+        let address = workspace.tabs[0].panes[&root].core.address.clone();
+        self.label_created(discovery, &address, labels);
         self.workspaces.push(workspace);
         self.active_workspace = self.workspaces.len() - 1;
         Ok(())
+    }
+
+    /// Labels a terminal created by this client; a labeling failure leaves the
+    /// terminal usable but unorganized, so it is surfaced as a notice only.
+    fn label_created(&mut self, discovery: &CoreDiscovery, address: &str, labels: Vec<String>) {
+        if let Err(err) = discovery.set_labels(address, &labels) {
+            self.notices.push(format!(
+                "created {address} without organization labels: {err}"
+            ));
+        }
     }
 
     pub fn add_tab(&mut self, discovery: &CoreDiscovery) -> io::Result<()> {
@@ -430,6 +744,7 @@ impl CoreSession {
             .unwrap_or_else(|| PathBuf::from("/"));
         let (tab, root) = CoreTab::new(format!("t{}", PaneId::alloc().raw()));
         let pane = CorePane::create(root, cwd, discovery, &self.context)?;
+        let address = pane.core.address.clone();
         let workspace = self
             .active_workspace_mut()
             .ok_or_else(|| io::Error::other("no active workspace"))?;
@@ -437,6 +752,8 @@ impl CoreSession {
         let index = workspace.tabs.len() - 1;
         workspace.tabs[index].panes.insert(root, pane);
         workspace.active_tab = index;
+        let labels = CoreOrganization::default().for_new_pane(workspace, &workspace.tabs[index]);
+        self.label_created(discovery, &address, labels);
         Ok(())
     }
 
@@ -460,9 +777,18 @@ impl CoreSession {
             .ok_or_else(|| io::Error::other("focused pane is not in the layout"))?;
         match CorePane::create(pane_id, cwd, discovery, &context) {
             Ok(pane) => {
+                let address = pane.core.address.clone();
                 tab.panes.insert(pane_id, pane);
                 tab.layout.focus_pane(pane_id);
                 tab.zoomed = false;
+                let labels = self
+                    .active_workspace()
+                    .zip(self.active_tab())
+                    .map(|(workspace, tab)| {
+                        CoreOrganization::default().for_new_pane(workspace, tab)
+                    })
+                    .unwrap_or_default();
+                self.label_created(discovery, &address, labels);
                 Ok(())
             }
             Err(err) => {
@@ -470,6 +796,56 @@ impl CoreSession {
                 Err(err)
             }
         }
+    }
+
+    /// Adopt an existing core terminal into the focused tab without replacing
+    /// any pane. The terminal keeps running on core; only the view changes.
+    pub fn adopt_terminal(
+        &mut self,
+        discovery: &CoreDiscovery,
+        core: CoreTerminal,
+    ) -> io::Result<()> {
+        if self.find_pane_by_address(&core.address).is_some() {
+            return Err(io::Error::other(format!(
+                "{} is already shown in this session",
+                core.address
+            )));
+        }
+        if core.state.as_deref() != Some("live") {
+            return Err(io::Error::other(format!(
+                "{} is not live; only live terminals can be adopted",
+                core.address
+            )));
+        }
+        let context = self.context.clone();
+        let tab = self
+            .active_tab_mut()
+            .ok_or_else(|| io::Error::other("no active tab"))?;
+        let target = tab.layout.focused();
+        let pane_id = tab
+            .layout
+            .split_pane(target, ratatui::layout::Direction::Horizontal, 0.5)
+            .ok_or_else(|| io::Error::other("focused pane is not in the layout"))?;
+        let (pane, notice) = CorePane::adopt(pane_id, core, discovery, &context);
+        tab.panes.insert(pane_id, pane);
+        tab.layout.focus_pane(pane_id);
+        tab.zoomed = false;
+        self.notices.extend(notice);
+        Ok(())
+    }
+
+    /// Remove a pane whose core terminal is gone, without killing anything.
+    pub fn remove_focused_missing(&mut self) -> io::Result<CloseOutcome> {
+        let state = self
+            .focused_pane()
+            .and_then(|pane| pane.core.state.as_deref())
+            .unwrap_or("missing");
+        if state == "live" {
+            return Err(io::Error::other(
+                "focused pane is live; use close to kill its terminal",
+            ));
+        }
+        self.close_focused_inner(None)
     }
 
     pub fn reattach_focused(&mut self, discovery: &CoreDiscovery) -> io::Result<()> {
@@ -514,6 +890,15 @@ impl CoreSession {
     }
 
     pub fn close_focused(&mut self, discovery: &CoreDiscovery) -> io::Result<CloseOutcome> {
+        self.close_focused_inner(Some(discovery))
+    }
+
+    /// Close the focused pane. With a discovery, a live core terminal is
+    /// killed; without one, the pane is only removed from the view.
+    fn close_focused_inner(
+        &mut self,
+        discovery: Option<&CoreDiscovery>,
+    ) -> io::Result<CloseOutcome> {
         let tab = self
             .active_tab_mut()
             .ok_or_else(|| io::Error::other("no active tab"))?;
@@ -523,7 +908,9 @@ impl CoreSession {
             .get(&pane_id)
             .ok_or_else(|| io::Error::other("focused pane is missing"))?;
         if pane.core.state.as_deref() == Some("live") {
-            discovery.kill_terminal(&pane.core.address)?;
+            if let Some(discovery) = discovery {
+                discovery.kill_terminal(&pane.core.address)?;
+            }
         }
         tab.panes.remove(&pane_id);
         if tab.layout.pane_count() > 1 {
@@ -682,6 +1069,7 @@ impl CoreSession {
 
     pub fn apply_core_event(&mut self, event: CoreEvent) -> bool {
         match event {
+            CoreEvent::Heartbeat | CoreEvent::ResyncNeeded => false,
             CoreEvent::Snapshot(terminals) => {
                 let mut changed = false;
                 for terminal in terminals {
@@ -765,6 +1153,14 @@ impl CoreSession {
             .find_map(|tab| tab.panes.get_mut(&pane_id))
     }
 
+    pub fn has_core_terminal(&self, address: &str) -> bool {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| tab.panes.values())
+            .any(|pane| pane.core.address == address)
+    }
+
     fn find_pane_by_address(&mut self, address: &str) -> Option<&mut CorePane> {
         self.workspaces
             .iter_mut()
@@ -843,6 +1239,60 @@ mod tests {
         assert_eq!(super::wrap_index(0, 3, -1), 2);
         assert_eq!(super::wrap_index(2, 3, 1), 0);
         assert_eq!(super::wrap_index(1, 3, 1), 2);
+    }
+
+    fn labeled(address: &str, space: &str, tab: &str, where_label: &str) -> super::CoreTerminal {
+        let mut core = super::CoreTerminal {
+            address: address.into(),
+            state: Some("live".into()),
+            cwd: Some("/repo".into()),
+            ..super::CoreTerminal::default()
+        };
+        core.labels.insert("herdr.space".into(), space.into());
+        core.labels.insert("herdr.tab".into(), tab.into());
+        core.labels.insert("where".into(), where_label.into());
+        core
+    }
+
+    #[test]
+    fn derives_workspaces_and_tabs_from_core_labels() {
+        let derived = super::CoreDerivedLayout::derive(vec![
+            labeled("t1", "sp1", "tb1", "main / 工作台"),
+            labeled("t2", "sp1", "tb1", "main / 工作台"),
+            labeled("t3", "sp1", "tb2", "main / second"),
+            labeled("t4", "sp2", "tb9", "ops / 值班"),
+            super::CoreTerminal {
+                address: "wild".into(),
+                state: Some("live".into()),
+                ..super::CoreTerminal::default()
+            },
+            super::CoreTerminal {
+                address: "dead".into(),
+                state: Some("finished".into()),
+                ..super::CoreTerminal::default()
+            },
+        ]);
+        assert_eq!(derived.workspaces.len(), 2);
+        assert_eq!(derived.workspaces[0].id, "sp1");
+        assert_eq!(derived.workspaces[0].name.as_deref(), Some("main"));
+        assert_eq!(derived.workspaces[0].tabs.len(), 2);
+        assert_eq!(derived.workspaces[0].tabs[0].terminals.len(), 2);
+        assert_eq!(
+            derived.workspaces[0].tabs[1].name.as_deref(),
+            Some("second")
+        );
+        assert_eq!(derived.workspaces[1].id, "sp2");
+        assert_eq!(derived.unorganized.len(), 1);
+        assert_eq!(derived.unorganized[0].address, "wild");
+    }
+
+    #[test]
+    fn derived_tab_layout_contains_every_terminal() {
+        let (tab, ids) =
+            super::CoreDerivedLayout::build_tab("t".into(), None, 3).expect("non-empty tab");
+        assert_eq!(ids.len(), 3);
+        assert_eq!(tab.layout.pane_count(), 3);
+        assert!(super::CoreDerivedLayout::build_tab("t".into(), None, 0).is_none());
     }
 
     #[test]

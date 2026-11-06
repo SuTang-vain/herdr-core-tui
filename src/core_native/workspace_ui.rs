@@ -216,7 +216,7 @@ fn draw(
                 let state = pane.core.state.as_deref().unwrap_or("unknown");
                 let message = match state {
                     "missing" => format!(
-                        "core terminal {} is missing\n\nNo replacement was started.",
+                        "core terminal {} is missing\n\nNo replacement was started.\nPress ctrl+b D to remove this pane.",
                         pane.core.address
                     ),
                     "finished" => {
@@ -246,7 +246,7 @@ fn draw(
         )
     } else if prefix {
         Span::styled(
-            "prefix: v/- split · x close · z zoom · c/N new · q detach UI",
+            "prefix: v/- split · x close · a adopt · D drop dead · c/N new · q detach",
             Style::default().fg(Color::Yellow),
         )
     } else {
@@ -291,7 +291,9 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
     let (context, mut events) = CoreRuntimeContext::new();
     let render_dirty = context.render_dirty();
     let snapshot = store::load()?;
-    let mut session = CoreSession::restore_or_create(snapshot, &discovery, context)?;
+    let discovered = discovery.enrich(discovered);
+    let mut session =
+        CoreSession::restore_or_create(snapshot, &discovery, context, discovered.clone())?;
     let (_core_listener, core_events) = CoreEventListener::spawn(&discovery)?;
     let mut terminal = init_terminal()?;
     let mut restore = TerminalRestore { active: true };
@@ -316,6 +318,11 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
             match event {
                 CoreEvent::Disconnected(error) => {
                     action_error = Some(error);
+                    needs_draw = true;
+                }
+                CoreEvent::Heartbeat => {}
+                CoreEvent::ResyncNeeded => {
+                    session.refresh_core(&discovery);
                     needs_draw = true;
                 }
                 event => {
@@ -381,6 +388,44 @@ pub(crate) fn run(discovery: CoreDiscovery, discovered: Vec<CoreTerminal>) -> io
                         KeyCode::Char('q') => {
                             save_session(&session, &mut action_error);
                             return Ok(());
+                        }
+                        KeyCode::Char('D') => {
+                            match session.remove_focused_missing() {
+                                Ok(outcome) => {
+                                    if outcome.exit_client {
+                                        save_session(&session, &mut action_error);
+                                        return Ok(());
+                                    }
+                                }
+                                Err(err) => action_error = Some(err.to_string()),
+                            }
+                            save_session(&session, &mut action_error);
+                        }
+                        KeyCode::Char('a') => {
+                            let terminals =
+                                discovery.discover().unwrap_or_else(|_| discovered.clone());
+                            let mut candidates: Vec<CoreTerminal> = terminals
+                                .into_iter()
+                                .filter(|core| {
+                                    core.state.as_deref() == Some("live")
+                                        && !session.has_core_terminal(&core.address)
+                                })
+                                .collect();
+                            candidates.sort_by(|a, b| a.address.cmp(&b.address));
+                            restore.suspend();
+                            let choice = super::ui::pick_adopt(&candidates);
+                            terminal = init_terminal()?;
+                            restore.active = true;
+                            match choice {
+                                Ok(Some(core)) => {
+                                    if let Err(err) = session.adopt_terminal(&discovery, core) {
+                                        action_error = Some(err.to_string());
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => action_error = Some(err.to_string()),
+                            }
+                            save_session(&session, &mut action_error);
                         }
                         KeyCode::Char('v') => {
                             if let Err(err) = session.split(&discovery, Direction::Horizontal) {

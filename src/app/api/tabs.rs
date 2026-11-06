@@ -435,8 +435,11 @@ mod tests {
     async fn tab_create_follows_cached_focused_pane_cwd_without_runtime() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Pin the legacy spawn path this test asserts on.
+        let mut config = Config::default();
+        config.terminal.backend = crate::config::TerminalBackendConfig::Local;
         let mut app = App::new(
-            &Config::default(),
+            &config,
             crate::app::AppPolicy::TEST,
             None,
             api_rx,

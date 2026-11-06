@@ -252,8 +252,8 @@ pub enum ShellModeConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TerminalBackendConfig {
-    #[default]
     Local,
+    #[default]
     HerdrCore,
 }
 
@@ -1401,7 +1401,7 @@ manifest_check = false
         assert_eq!(default_config.terminal.shell_mode, ShellModeConfig::Auto);
         assert_eq!(
             default_config.terminal.backend,
-            TerminalBackendConfig::Local
+            TerminalBackendConfig::HerdrCore
         );
 
         let toml = r#"

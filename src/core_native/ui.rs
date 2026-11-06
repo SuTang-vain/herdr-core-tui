@@ -242,6 +242,76 @@ pub(crate) fn run(discovery: CoreDiscovery, mut terminals: Vec<CoreTerminal>) ->
     }
 }
 
+/// Pick a live core terminal to adopt into the workspace view. Returns
+/// `Ok(None)` when the user cancels. Manages its own terminal session so the
+/// caller's workspace UI stays suspended until the choice is made.
+pub(crate) fn pick_adopt(terminals: &[CoreTerminal]) -> io::Result<Option<CoreTerminal>> {
+    if terminals.is_empty() {
+        return Ok(None);
+    }
+    let mut terminal = ratatui::init();
+    let restore = TerminalRestore { active: true };
+    let mut selected = 0usize;
+    let choice = loop {
+        terminal.draw(|frame| {
+            let areas = Layout::vertical([
+                Constraint::Length(2),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(frame.area());
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "Herdr",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" · core-native · adopt a core terminal"),
+                ])),
+                areas[0],
+            );
+            let lines: Vec<Line> = terminals
+                .iter()
+                .enumerate()
+                .map(|(index, core)| terminal_line(core, index == selected))
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(Block::bordered().title(" unshown terminals "))
+                    .wrap(Wrap { trim: false }),
+                areas[1],
+            );
+            frame.render_widget(
+                Paragraph::new("↑↓/j/k select · enter adopt · esc cancel")
+                    .style(Style::default().fg(Color::DarkGray)),
+                areas[2],
+            );
+        })?;
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => break None,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1).min(terminals.len() - 1);
+                }
+                KeyCode::Enter => break Some(terminals[selected].clone()),
+                _ => {}
+            },
+            _ => {}
+        }
+    };
+    drop(restore);
+    drop(terminal);
+    Ok(choice)
+}
+
 #[cfg(test)]
 mod tests {
     use super::terminal_line;

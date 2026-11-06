@@ -2285,8 +2285,11 @@ mod tests {
     #[tokio::test]
     async fn pane_died_respawns_shell_and_clears_restored_agent_session() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Pin the legacy spawn path this test asserts on.
+        let mut config = crate::config::Config::default();
+        config.terminal.backend = crate::config::TerminalBackendConfig::Local;
         let mut app = App::new(
-            &crate::config::Config::default(),
+            &config,
             crate::app::AppPolicy::TEST,
             None,
             api_rx,

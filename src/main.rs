@@ -107,7 +107,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 
 [terminal]
 # Runtime used for new pane terminals: "local" or "herdr-core".
-# backend = "local"
+# backend = "herdr-core"
 
 # Executable used for new interactive panes.
 # Empty means $SHELL, then /bin/sh.

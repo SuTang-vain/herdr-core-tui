@@ -945,8 +945,12 @@ action = "open"
 
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        // These tests assert legacy pane-spawn argv/env, so pin the local
+        // backend instead of depending on the configurable default.
+        let mut config = crate::config::Config::default();
+        config.terminal.backend = crate::config::TerminalBackendConfig::Local;
         App::new(
-            &crate::config::Config::default(),
+            &config,
             crate::app::AppPolicy::TEST,
             None,
             api_rx,

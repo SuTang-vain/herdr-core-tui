@@ -14,9 +14,38 @@ pub(crate) struct CoreTerminal {
     pub agent: Option<String>,
     pub cwd: Option<String>,
     pub turn: Option<u64>,
+    #[serde(default)]
+    pub labels: std::collections::HashMap<String, String>,
+}
+
+pub(crate) const SPACE_LABEL: &str = "herdr.space";
+pub(crate) const TAB_LABEL: &str = "herdr.tab";
+pub(crate) const WHERE_LABEL: &str = "where";
+
+/// Split a `where` label ("space / tab") into its workspace and tab names.
+pub(crate) fn parse_where(value: &str) -> Option<(String, String)> {
+    let (workspace, tab) = value.split_once(" / ")?;
+    let workspace = workspace.trim();
+    let tab = tab.trim();
+    if workspace.is_empty() || tab.is_empty() {
+        return None;
+    }
+    Some((workspace.to_string(), tab.to_string()))
 }
 
 impl CoreTerminal {
+    /// Human-readable workspace/tab organization shared with other core clients.
+    pub(crate) fn where_parts(&self) -> Option<(String, String)> {
+        self.labels.get(WHERE_LABEL).and_then(|v| parse_where(v))
+    }
+
+    pub(crate) fn space_label(&self) -> Option<&str> {
+        self.labels.get(SPACE_LABEL).map(String::as_str)
+    }
+
+    pub(crate) fn tab_label(&self) -> Option<&str> {
+        self.labels.get(TAB_LABEL).map(String::as_str)
+    }
     pub(crate) fn status_state(&self) -> Option<&str> {
         match self.status.as_ref()? {
             serde_json::Value::String(state) => Some(state),
@@ -97,6 +126,25 @@ impl CoreDiscovery {
                 format!("invalid core terminal {address}: {err}"),
             )
         })
+    }
+
+    pub(crate) fn set_labels(&self, address: &str, labels: &[String]) -> io::Result<()> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let output = Command::new(&self.cli)
+            .arg("label")
+            .arg(address)
+            .args(labels)
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "could not label core terminal {address}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
     }
 
     pub(crate) fn kill_terminal(&self, address: &str) -> io::Result<()> {
@@ -184,6 +232,21 @@ impl CoreDiscovery {
         Ok(terminal)
     }
 
+    /// `hc ls` omits labels, so organization-aware restore needs one `get`
+    /// per terminal. Failures keep the list entry (adoption stays possible).
+    pub(crate) fn enrich(&self, terminals: Vec<CoreTerminal>) -> Vec<CoreTerminal> {
+        terminals
+            .into_iter()
+            .map(|core| {
+                if core.state.as_deref() == Some("live") && core.labels.is_empty() {
+                    self.get_terminal(&core.address).unwrap_or(core)
+                } else {
+                    core
+                }
+            })
+            .collect()
+    }
+
     pub(crate) fn discover(&self) -> io::Result<Vec<CoreTerminal>> {
         let output = Command::new(&self.cli)
             .args(["ls", "--json"])
@@ -236,6 +299,28 @@ mod tests {
         assert_eq!(terminals[1].status_app(), Some("kimi-code"));
         assert_eq!(terminals[1].status_state(), Some("working"));
         assert_eq!(terminals[1].turn, Some(3));
+    }
+
+    #[test]
+    fn parses_where_labels_into_workspace_and_tab_names() {
+        let terminal: super::CoreTerminal = serde_json::from_str(
+            r#"{"address":"t8","labels":{"herdr.space":"sp1","herdr.tab":"tb1","where":"main / 工作台"}}"#,
+        )
+        .expect("labeled terminal");
+        assert_eq!(
+            terminal.where_parts(),
+            Some(("main".to_string(), "工作台".to_string()))
+        );
+        assert_eq!(terminal.space_label(), Some("sp1"));
+        assert_eq!(terminal.tab_label(), Some("tb1"));
+
+        assert!(super::parse_where("no separator").is_none());
+        assert!(super::parse_where(" / tab").is_none());
+        assert!(super::parse_where("space / ").is_none());
+        assert_eq!(
+            super::parse_where("a / b / c"),
+            Some(("a".to_string(), "b / c".to_string()))
+        );
     }
 
     #[test]
